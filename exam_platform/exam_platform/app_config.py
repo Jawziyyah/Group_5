@@ -25,3 +25,11 @@ def require_teacher() -> dict:
         st.warning("Please log in on the Teacher login page first.")
         st.stop()
     return teacher
+
+
+def require_student() -> dict:
+    student = st.session_state.get("student")
+    if not student:
+        st.warning("Please sign in on the Student sign in page first.")
+        st.stop()
+    return student
