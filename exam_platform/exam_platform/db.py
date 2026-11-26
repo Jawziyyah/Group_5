@@ -13,7 +13,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select,
+    JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
+    create_engine, inspect, or_, select, text,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
@@ -39,6 +40,16 @@ class Teacher(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(120))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class Student(Base):
+    __tablename__ = "students"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    student_ref: Mapped[str] = mapped_column(String(60), default="")   # matric / admission number
     password_hash: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
@@ -81,10 +92,13 @@ class Submission(Base):
     __table_args__ = (UniqueConstraint("assessment_id", "student_key", name="one_submission_per_student"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     assessment_id: Mapped[int] = mapped_column(ForeignKey("assessments.id"), index=True)
+    student_id: Mapped[Optional[int]] = mapped_column(ForeignKey("students.id"), index=True, nullable=True)
     student_name: Mapped[str] = mapped_column(String(120))
     student_ref: Mapped[str] = mapped_column(String(60), default="")
     student_key: Mapped[str] = mapped_column(String(200))
     submitted_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    # Optional integrity data (tab switches, paste events, risk level...) saved by the exam guard.
+    integrity_report: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     assessment: Mapped["Assessment"] = relationship(back_populates="submissions")
     answers: Mapped[list["Answer"]] = relationship(
         back_populates="submission", cascade="all, delete-orphan", order_by="Answer.id")
@@ -102,8 +116,32 @@ class Answer(Base):
     submission: Mapped["Submission"] = relationship(back_populates="answers")
 
 
+class Attempt(Base):
+    """When a student started an assessment. Stored so refreshing the page can't restart the timer."""
+    __tablename__ = "attempts"
+    __table_args__ = (UniqueConstraint("assessment_id", "student_id", name="one_attempt_per_student"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assessment_id: Mapped[int] = mapped_column(ForeignKey("assessments.id"), index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("students.id"), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 # ------------------------------------------------------------------ engine
 _engine = None
+
+
+def _migrate(engine) -> None:
+    """Add columns introduced after the first version to an EXISTING database.
+    create_all() creates missing tables but never adds columns to tables that already exist."""
+    insp = inspect(engine)
+    if "submissions" not in insp.get_table_names():
+        return
+    existing = {c["name"] for c in insp.get_columns("submissions")}
+    wanted = {"student_id": "INTEGER", "integrity_report": "JSON"}
+    with engine.begin() as con:
+        for col, ddl in wanted.items():
+            if col not in existing:
+                con.execute(text(f"ALTER TABLE submissions ADD COLUMN {col} {ddl}"))
 
 
 def init(url: Optional[str] = None, force: bool = False):
@@ -119,6 +157,7 @@ def init(url: Optional[str] = None, force: bool = False):
         kwargs["connect_args"] = {"check_same_thread": False}
     _engine = create_engine(url, **kwargs)
     Base.metadata.create_all(_engine)
+    _migrate(_engine)
     return _engine
 
 
@@ -141,6 +180,11 @@ def _assessment_dict(a: Assessment, with_questions: bool = True) -> dict:
     if with_questions:
         d["questions"] = [_question_dict(q) for q in a.questions]
     return d
+
+
+def _answer_dict(x: Answer) -> dict:
+    return dict(id=x.id, question_id=x.question_id, response=x.response,
+                awarded=x.awarded, feedback=x.feedback or "", graded_by=x.graded_by)
 
 
 def _owned(s: Session, assessment_id: int, teacher_id: int) -> Assessment:
@@ -169,6 +213,61 @@ def get_teacher_by_email(email: str) -> Optional[dict]:
     with _session() as s:
         t = s.scalar(select(Teacher).where(Teacher.email == email.strip().lower()))
         return None if t is None else dict(id=t.id, email=t.email, name=t.name, password_hash=t.password_hash)
+
+
+# ------------------------------------------------------------------ students
+def _student_dict(st: Student, with_hash: bool = False) -> dict:
+    d = dict(id=st.id, email=st.email, name=st.name, student_ref=st.student_ref or "")
+    if with_hash:
+        d["password_hash"] = st.password_hash
+    return d
+
+
+def create_student(email: str, name: str, ref: str, password_hash: str) -> dict:
+    with _session() as s:
+        st = Student(email=email.strip().lower(), name=name.strip(),
+                     student_ref=(ref or "").strip(), password_hash=password_hash)
+        s.add(st)
+        try:
+            s.commit()
+        except IntegrityError:
+            s.rollback()
+            raise DuplicateError("An account with this email already exists.")
+        return _student_dict(st)
+
+
+def get_student_by_email(email: str) -> Optional[dict]:
+    """Includes password_hash, for login checks."""
+    with _session() as s:
+        st = s.scalar(select(Student).where(Student.email == email.strip().lower()))
+        return None if st is None else _student_dict(st, with_hash=True)
+
+
+def get_student(student_id: int) -> Optional[dict]:
+    with _session() as s:
+        st = s.get(Student, student_id)
+        return None if st is None else _student_dict(st)
+
+
+def update_student_password(student_id: int, password_hash: str) -> None:
+    with _session() as s:
+        st = s.get(Student, student_id)
+        if st is None:
+            raise LookupError("Student not found.")
+        st.password_hash = password_hash
+        s.commit()
+
+
+def update_student_profile(student_id: int, name: str, ref: str) -> dict:
+    """Note: submissions already made keep the name/reference they were submitted with."""
+    with _session() as s:
+        st = s.get(Student, student_id)
+        if st is None:
+            raise LookupError("Student not found.")
+        st.name = name.strip() or st.name
+        st.student_ref = (ref or "").strip()
+        s.commit()
+        return _student_dict(st)
 
 
 # ------------------------------------------------------------------ assessments
@@ -272,21 +371,59 @@ def _student_key(name: str, ref: str) -> str:
 
 
 def student_exists(assessment_id: int, name: str, ref: str = "") -> bool:
+    """True if a student with this name + reference has already submitted this assessment."""
     with _session() as s:
         return s.scalar(select(Submission.id).where(
             Submission.assessment_id == assessment_id,
             Submission.student_key == _student_key(name, ref))) is not None
 
 
-def create_submission(assessment_id: int, name: str, ref: str, responses: dict[int, str],
-                      marks: dict[int, tuple[Optional[int], Optional[str]]]) -> int:
-    """responses: question_id -> answer text. marks: question_id -> (awarded or None, graded_by or None)."""
+def student_has_submitted(assessment_id: int, student_id: int) -> bool:
+    """Same check for a logged-in student. Also catches older submissions made by name + reference."""
+    with _session() as s:
+        st = s.get(Student, student_id)
+        if st is None:
+            return False
+        return s.scalar(select(Submission.id).where(
+            Submission.assessment_id == assessment_id,
+            or_(Submission.student_id == student_id,
+                Submission.student_key == _student_key(st.name, st.student_ref)))) is not None
+
+
+def start_attempt(assessment_id: int, student_id: int) -> datetime:
+    """Returns when this student started the assessment (UTC). The first call records the start;
+    later calls (for example after a page refresh) return the same time."""
+    with _session() as s:
+        row = s.scalar(select(Attempt).where(Attempt.assessment_id == assessment_id,
+                                             Attempt.student_id == student_id))
+        if row is None:
+            row = Attempt(assessment_id=assessment_id, student_id=student_id)
+            s.add(row)
+            try:
+                s.commit()
+            except IntegrityError:        # two tabs started at once
+                s.rollback()
+                row = s.scalar(select(Attempt).where(Attempt.assessment_id == assessment_id,
+                                                     Attempt.student_id == student_id))
+        return row.started_at
+
+
+def create_submission(assessment_id: int, student_id: int, responses: dict[int, str],
+                      marks: dict[int, tuple[Optional[int], Optional[str]]],
+                      integrity_report: Optional[dict] = None) -> int:
+    """responses: question_id -> answer text. marks: question_id -> (awarded or None, graded_by or None).
+    The student's name and reference are taken from their account."""
     with _session() as s:
         a = s.get(Assessment, assessment_id)
         if a is None or a.status != "published":
             raise ValueError("This assessment is not accepting submissions.")
-        sub = Submission(assessment_id=assessment_id, student_name=name.strip(), student_ref=ref.strip(),
-                         student_key=_student_key(name, ref))
+        st = s.get(Student, student_id)
+        if st is None:
+            raise ValueError("Student account not found.")
+        sub = Submission(assessment_id=assessment_id, student_id=student_id,
+                         student_name=st.name, student_ref=st.student_ref or "",
+                         student_key=_student_key(st.name, st.student_ref or ""),
+                         integrity_report=integrity_report)
         for q in a.questions:
             awarded, by = marks.get(q.id, (None, None))
             sub.answers.append(Answer(question_id=q.id, response=responses.get(q.id) or "",
@@ -301,13 +438,13 @@ def create_submission(assessment_id: int, name: str, ref: str, responses: dict[i
 
 
 def list_submissions(assessment_id: int, teacher_id: int) -> list[dict]:
+    """Teacher view: all submissions for one assessment."""
     with _session() as s:
         a = _owned(s, assessment_id, teacher_id)
-        return [dict(id=sub.id, student_name=sub.student_name, student_ref=sub.student_ref,
-                     submitted_at=sub.submitted_at,
-                     answers=[dict(id=x.id, question_id=x.question_id, response=x.response,
-                                   awarded=x.awarded, feedback=x.feedback or "", graded_by=x.graded_by)
-                              for x in sub.answers])
+        return [dict(id=sub.id, student_id=sub.student_id, student_name=sub.student_name,
+                     student_ref=sub.student_ref, submitted_at=sub.submitted_at,
+                     integrity_report=sub.integrity_report,
+                     answers=[_answer_dict(x) for x in sub.answers])
                 for sub in a.submissions]
 
 
@@ -322,3 +459,59 @@ def update_answer(answer_id: int, teacher_id: int, awarded: Optional[int], feedb
         ans.feedback = feedback or ""
         ans.graded_by = graded_by
         s.commit()
+
+
+# ------------------------------------------------------------------ student activity
+def _score_summary(sub: Submission) -> dict:
+    out_of = sum(q.marks for q in sub.assessment.questions)
+    got = sum(x.awarded for x in sub.answers if x.awarded is not None)
+    pending = sum(1 for x in sub.answers if x.awarded is None)
+    return dict(got=got, out_of=out_of, pending=pending)
+
+
+def _released(sub: Submission) -> bool:
+    """Results are visible to the student only when the teacher allows it (the assessment's show_score)."""
+    return bool(sub.assessment.show_score)
+
+
+def _student_submission_filter(st: Student):
+    """A student's submissions: linked by id, or older ones made by name + reference."""
+    return or_(Submission.student_id == st.id,
+               Submission.student_key == _student_key(st.name, st.student_ref))
+
+
+def list_student_submissions(student_id: int) -> list[dict]:
+    """Everything a student has submitted, newest first.
+    Keys: id, assessment_id, title, submitted_at, released, got, out_of, pending.
+    Scores are None until the teacher releases results."""
+    with _session() as s:
+        st = s.get(Student, student_id)
+        if st is None:
+            return []
+        subs = s.scalars(select(Submission).where(_student_submission_filter(st))
+                         .order_by(Submission.submitted_at.desc(), Submission.id.desc())).all()
+        out = []
+        for sub in subs:
+            released = _released(sub)
+            summary = _score_summary(sub) if released else dict(got=None, out_of=None, pending=None)
+            out.append(dict(id=sub.id, assessment_id=sub.assessment_id, title=sub.assessment.title,
+                            submitted_at=sub.submitted_at, released=released, **summary))
+        return out
+
+
+def get_student_result(student_id: int, submission_id: int) -> Optional[dict]:
+    """One submission for the student's results page. Returns None if it isn't this student's.
+    Keys: id, title, released, answers, questions.
+    When results are not released, answers and questions are empty so nothing leaks."""
+    with _session() as s:
+        st = s.get(Student, student_id)
+        sub = s.get(Submission, submission_id)
+        if st is None or sub is None:
+            return None
+        if sub.student_id != st.id and sub.student_key != _student_key(st.name, st.student_ref):
+            return None
+        released = _released(sub)
+        return dict(id=sub.id, title=sub.assessment.title, submitted_at=sub.submitted_at,
+                    released=released,
+                    answers=[_answer_dict(x) for x in sub.answers] if released else [],
+                    questions=[_question_dict(q) for q in sub.assessment.questions] if released else [])
