@@ -3,7 +3,7 @@ import streamlit as st
 
 import db
 from app_config import get_secret
-
+# DATABASE_URL = 
 st.set_page_config(page_title="Exam Platform", page_icon="📝", layout="centered")
 db.init(get_secret("DATABASE_URL"))
 
